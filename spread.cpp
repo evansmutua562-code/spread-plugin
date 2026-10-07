@@ -81,6 +81,8 @@ public:
     virtual void* CreateBot(const char*) = 0;
 };
 
+struct Pt { Vec p; float t; };
+
 static IPlayerInfoManager* g_pim = 0;
 static IBotManager* g_bm = 0;
 static void* g_ents[64];
@@ -88,18 +90,20 @@ static int g_count = 0;
 static double g_last = 0;
 static bool g_firstFrame = true;
 static double g_t0 = 0;
+static char g_map[64] = "unknown";
 
 static const int MAXP = 1200;
-static Vec g_path[MAXP];
+static Pt g_path[MAXP];
 static int g_np = 0;
-static int g_state = 0;
+static int g_endIdx = 1;
+static int g_state = 0;   // 0 wait, 1 record, 2 replay, 3 hold, 4 done
 static void* g_human = 0;
 static void* g_bot = 0;
-static Vec g_start, g_pos;
+static Vec g_start, g_prev, g_pos, g_endAng;
 static bool g_moved = false;
-static double g_lastSample = 0, g_stillSince = 0, g_lastT = 0, g_lastLog = 0, g_holdStart = 0;
+static double g_lastSample = 0, g_stillSince = 0, g_recT0 = 0, g_lastLog = 0, g_holdStart = 0, g_rs = 0;
 static int g_idx = 0;
-static int g_humanTeam = 0;
+static int g_humanTeam = 2;
 static int g_lastHp = -1;
 
 static void AddEnt(void* e) {
@@ -117,14 +121,56 @@ static IPlayerInfo* Info(void* e) {
     return (e && g_pim) ? g_pim->GetPlayerInfo(e) : 0;
 }
 
+static void RoutePath(char* buf, int n) {
+    snprintf(buf, n, "/storage/emulated/0/counter strike/spread_route_%s.txt", g_map);
+}
+
+static void SaveRoute() {
+    char fn[256]; RoutePath(fn, sizeof(fn));
+    FILE* f = fopen(fn, "w");
+    if (!f) { Log("ROUTE: cannot write %s", fn); return; }
+    fprintf(f, "%d %d %.2f %.2f %.2f\n", g_np, g_humanTeam, g_endAng.x, g_endAng.y, g_endAng.z);
+    for (int i = 0; i < g_np; i++)
+        fprintf(f, "%.2f %.1f %.1f %.1f\n", g_path[i].t, g_path[i].p.x, g_path[i].p.y, g_path[i].p.z);
+    fclose(f);
+    Log("ROUTE: saved %d points to %s", g_np, fn);
+}
+
+static bool LoadRoute() {
+    char fn[256]; RoutePath(fn, sizeof(fn));
+    FILE* f = fopen(fn, "r");
+    if (!f) return false;
+    int n = 0, team = 2; float ax, ay, az;
+    if (fscanf(f, "%d %d %f %f %f", &n, &team, &ax, &ay, &az) != 5 || n < 3 || n > MAXP) {
+        fclose(f); Log("ROUTE: bad header in %s", fn); return false;
+    }
+    for (int i = 0; i < n; i++) {
+        if (fscanf(f, "%f %f %f %f", &g_path[i].t, &g_path[i].p.x, &g_path[i].p.y, &g_path[i].p.z) != 4) {
+            fclose(f); Log("ROUTE: bad data at line %d", i + 2); return false;
+        }
+    }
+    fclose(f);
+    g_np = n; g_humanTeam = team;
+    g_endAng.x = ax; g_endAng.y = ay; g_endAng.z = az;
+    Log("ROUTE: loaded %d points for team %d from %s", n, team, fn);
+    return true;
+}
+
+static int ComputeEnd() {
+    int e = g_np - 1;
+    while (e > 1 && Dist(g_path[e].p, g_path[g_np - 1].p) < 70.0f) e--;
+    return e;
+}
+
 static void Census() {
     Log("--- census (%d clients) ---", g_count);
     if (!g_pim) { Log("PlayerInfoManager not available"); return; }
     for (int i = 0; i < g_count; i++) {
         IPlayerInfo* p = Info(g_ents[i]);
         if (!p) { Log("  slot %d: no info", i); continue; }
-        Log("  %s | team %d | %s | %s | hp %d", p->GetName(), p->GetTeamIndex(),
-            p->IsFakeClient() ? "BOT" : "HUMAN", p->IsDead() ? "dead" : "alive", p->GetHealth());
+        Log("  %s | team %d | %s | %s | hp %d | %s", p->GetName(), p->GetTeamIndex(),
+            p->IsFakeClient() ? "BOT" : "HUMAN", p->IsDead() ? "dead" : "alive",
+            p->GetHealth(), p->GetWeaponName() ? p->GetWeaponName() : "?");
     }
 }
 
@@ -132,10 +178,19 @@ static void TrackHp(IPlayerInfo* b) {
     int hp = b->GetHealth();
     if (hp != g_lastHp) {
         Vec a = b->GetAbsOrigin();
-        Log("HP: %d -> %d | route point %d/%d | actual (%.0f %.0f %.0f) | ours (%.0f %.0f %.0f)",
-            g_lastHp, hp, g_idx, g_np, a.x, a.y, a.z, g_pos.x, g_pos.y, g_pos.z);
+        Log("HP: %d -> %d | route point %d/%d | actual (%.0f %.0f %.0f)",
+            g_lastHp, hp, g_idx, g_np, a.x, a.y, a.z);
         g_lastHp = hp;
     }
+}
+
+static void FinishRecording(IPlayerInfo* h) {
+    if (g_np > 24) g_np -= 12;   // drop the still seconds at the end
+    g_humanTeam = h->GetTeamIndex();
+    g_endAng = h->GetAbsAngles();
+    Log("PATH: recorded %d points, %.1f seconds", g_np, g_path[g_np - 1].t);
+    SaveRoute();
+    g_state = 2; g_bot = 0; g_lastLog = Now();
 }
 
 static void PathTest(double t) {
@@ -143,17 +198,17 @@ static void PathTest(double t) {
 
     if (g_state == 0) {
         if (t - g_t0 < 5.0) return;
+        if (LoadRoute()) { g_state = 2; g_bot = 0; g_lastLog = t; return; }
         for (int i = 0; i < g_count; i++) {
             IPlayerInfo* p = Info(g_ents[i]);
             if (p && !p->IsFakeClient() && !p->IsDead() && p->GetTeamIndex() >= 2) {
                 g_human = g_ents[i];
                 g_start = p->GetAbsOrigin();
-                g_np = 0;
-                g_moved = false;
-                g_lastSample = t;
-                g_stillSince = t;
+                g_prev = g_start;
+                g_np = 0; g_moved = false;
+                g_lastSample = t; g_stillSince = t;
                 g_state = 1;
-                Log("PATH: recording started. Walk your route and stop at the hold spot for 3 seconds.");
+                Log("PATH: no saved route, recording started. Walk your route, pause where you want him to pause, stop at the hold spot for 3 seconds.");
                 return;
             }
         }
@@ -169,24 +224,15 @@ static void PathTest(double t) {
         if (!g_moved) {
             if (Dist(pos, g_start) < 60) return;
             g_moved = true;
-            g_path[g_np++] = g_start;
-            g_stillSince = t;
+            g_recT0 = t;
+            g_path[0].p = g_start; g_path[0].t = 0; g_np = 1;
+            g_stillSince = t; g_prev = pos;
         }
-        Vec last = g_path[g_np - 1];
-        if (Dist(pos, last) >= 20) {
-            if (g_np < MAXP) g_path[g_np++] = pos;
-            g_stillSince = t;
-        } else if (t - g_stillSince >= 3.0 && Dist(pos, g_path[0]) >= 500 && g_np >= 20) {
-            g_humanTeam = h->GetTeamIndex();
-            Log("PATH: recorded %d points, ending at (%.0f %.0f %.0f)", g_np, pos.x, pos.y, pos.z);
-            g_state = 2; g_bot = 0; g_lastT = t; g_lastLog = t;
-            return;
-        }
-        if (g_np >= MAXP) {
-            g_humanTeam = h->GetTeamIndex();
-            Log("PATH: path buffer full, using %d points", g_np);
-            g_state = 2; g_bot = 0; g_lastT = t; g_lastLog = t;
-        }
+        if (g_np < MAXP) { g_path[g_np].p = pos; g_path[g_np].t = (float)(t - g_recT0); g_np++; }
+        if (Dist(pos, g_prev) >= 8.0f) g_stillSince = t;
+        g_prev = pos;
+        if (t - g_stillSince >= 3.0 && Dist(pos, g_path[0].p) >= 500 && g_np >= 20) { FinishRecording(h); return; }
+        if (g_np >= MAXP) { Log("PATH: buffer full"); FinishRecording(h); }
         return;
     }
 
@@ -199,70 +245,68 @@ static void PathTest(double t) {
                     if (!bc0) { Log("PATH: GetBotController returned null"); g_state = 4; return; }
                     g_bot = g_ents[i];
                     Vec was = p->GetAbsOrigin();
-                    g_pos = g_path[0];
+                    g_endIdx = ComputeEnd();
+                    g_pos = g_path[0].p;
                     bc0->SetAbsOrigin(g_pos);
-                    g_idx = 1;
-                    g_lastT = t;
-                    g_lastLog = t;
-                    g_lastHp = -1;
-                    Log("PATH: bot %s jumped from (%.0f %.0f %.0f) to route start (%.0f %.0f %.0f), hp %d",
-                        p->GetName(), was.x, was.y, was.z, g_pos.x, g_pos.y, g_pos.z, p->GetHealth());
+                    g_idx = 0; g_rs = t; g_lastLog = t; g_lastHp = -1;
+                    Log("PATH: bot %s jumped from (%.0f %.0f %.0f) to route start, end point %d of %d, hp %d",
+                        p->GetName(), was.x, was.y, was.z, g_endIdx, g_np, p->GetHealth());
                     break;
                 }
             }
             if (!g_bot) {
-                if (t - g_lastLog >= 5.0) { Log("PATH: no living bot on your team, waiting"); g_lastLog = t; }
+                if (t - g_lastLog >= 5.0) { Log("PATH: no living bot on team %d, waiting", g_humanTeam); g_lastLog = t; }
                 return;
             }
         }
         IPlayerInfo* b = Info(g_bot);
         if (!b || b->IsDead()) {
-            Log("PATH: bot died or left at route point %d of %d, last hp %d, last pos (%.0f %.0f %.0f)",
-                g_idx, g_np, g_lastHp, g_pos.x, g_pos.y, g_pos.z);
+            Log("PATH: bot died or left at route point %d of %d, last hp %d", g_idx, g_np, g_lastHp);
             g_state = 4; return;
         }
         TrackHp(b);
         IBotController* bc = g_bm->GetBotController(g_bot);
         if (!bc) { Log("PATH: GetBotController returned null"); g_state = 4; return; }
-        double dt = t - g_lastT;
-        g_lastT = t;
-        if (dt > 0.2) dt = 0.2;
-        float budget = 250.0f * (float)dt;
-        while (budget > 0 && g_idx < g_np) {
-            Vec tgt = g_path[g_idx];
-            float d = Dist(g_pos, tgt);
-            if (d <= budget) { g_pos = tgt; budget -= d; g_idx++; }
-            else {
-                float f = budget / d;
-                g_pos.x += (tgt.x - g_pos.x) * f;
-                g_pos.y += (tgt.y - g_pos.y) * f;
-                g_pos.z += (tgt.z - g_pos.z) * f;
-                budget = 0;
-            }
+        float el = (float)(t - g_rs);
+        if (el >= g_path[g_endIdx].t) {
+            g_pos = g_path[g_endIdx].p; g_idx = g_endIdx;
+            bc->SetAbsOrigin(g_pos);
+            bc->SetAbsAngles(g_endAng);
+            Log("PATH: arrived at (%.0f %.0f %.0f), holding 40s, facing yaw %.0f", g_pos.x, g_pos.y, g_pos.z, g_endAng.y);
+            g_holdStart = t; g_state = 3;
+            return;
         }
+        while (g_idx + 1 <= g_endIdx && g_path[g_idx + 1].t <= el) g_idx++;
+        Pt& a = g_path[g_idx];
+        Pt& c = g_path[g_idx + 1];
+        float span = c.t - a.t;
+        float f = span > 0.001f ? (el - a.t) / span : 1.0f;
+        if (f > 1.0f) f = 1.0f;
+        g_pos.x = a.p.x + (c.p.x - a.p.x) * f;
+        g_pos.y = a.p.y + (c.p.y - a.p.y) * f;
+        g_pos.z = a.p.z + (c.p.z - a.p.z) * f;
         bc->SetAbsOrigin(g_pos);
         if (t - g_lastLog >= 2.0) {
-            Log("PATH: replay point %d/%d, bot at (%.0f %.0f %.0f)", g_idx, g_np, g_pos.x, g_pos.y, g_pos.z);
+            Log("PATH: replay %.1fs, point %d/%d, bot at (%.0f %.0f %.0f)", el, g_idx, g_endIdx, g_pos.x, g_pos.y, g_pos.z);
             g_lastLog = t;
         }
-        if (g_idx >= g_np) { Log("PATH: arrived, holding 15s"); g_holdStart = t; g_state = 3; }
         return;
     }
 
     if (g_state == 3) {
         IPlayerInfo* b = Info(g_bot);
-        if (!b || b->IsDead()) { Log("PATH: bot died while holding, last hp %d", g_lastHp); g_state = 4; return; }
+        if (!b || b->IsDead()) { Log("PATH: bot died while holding, last hp %d, weapon %s", g_lastHp, b && b->GetWeaponName() ? b->GetWeaponName() : "?"); g_state = 4; return; }
         TrackHp(b);
         IBotController* bc = g_bm->GetBotController(g_bot);
-        if (bc) bc->SetAbsOrigin(g_pos);
-        if (t - g_holdStart >= 15.0) { Log("PATH: released"); g_state = 4; }
+        if (bc) { bc->SetAbsOrigin(g_pos); bc->SetAbsAngles(g_endAng); }
+        if (t - g_holdStart >= 40.0) { Log("PATH: released after 40s"); g_state = 4; }
     }
 }
 
 class SpreadPlugin {
 public:
     virtual bool Load(CreateInterfaceFn, CreateInterfaceFn gameFactory) {
-        Log("=== Spread v0.5 loaded ===");
+        Log("=== Spread v0.6 loaded ===");
         if (gameFactory) {
             g_pim = (IPlayerInfoManager*)gameFactory("PlayerInfoManager002", 0);
             g_bm = (IBotManager*)gameFactory("BotManager001", 0);
@@ -274,9 +318,10 @@ public:
     virtual void Unload() { Log("Unload called"); g_pim = 0; g_bm = 0; g_count = 0; }
     virtual void Pause() {}
     virtual void UnPause() {}
-    virtual const char* GetPluginDescription() { return "Spread v0.5"; }
+    virtual const char* GetPluginDescription() { return "Spread v0.6"; }
     virtual void LevelInit(const char* map) {
         Log("map: %s", map ? map : "?");
+        snprintf(g_map, sizeof(g_map), "%s", map ? map : "unknown");
         g_state = 0; g_np = 0; g_human = 0; g_bot = 0; g_firstFrame = true; g_lastHp = -1;
     }
     virtual void ServerActivate(void*, int, int maxc) { Log("server activate, maxclients %d", maxc); }
