@@ -47,6 +47,13 @@ public:
     virtual bool IsInAVehicle() = 0;
     virtual bool IsObserver() = 0;
     virtual Vec GetAbsOrigin() = 0;
+    virtual Vec GetAbsAngles() = 0;
+    virtual Vec GetPlayerMins() = 0;
+    virtual Vec GetPlayerMaxs() = 0;
+    virtual const char* GetWeaponName() = 0;
+    virtual const char* GetModelName() = 0;
+    virtual int GetHealth() = 0;
+    virtual int GetMaxHealth() = 0;
 };
 
 class IPlayerInfoManager {
@@ -82,11 +89,10 @@ static double g_last = 0;
 static bool g_firstFrame = true;
 static double g_t0 = 0;
 
-// path record + replay test
 static const int MAXP = 1200;
 static Vec g_path[MAXP];
 static int g_np = 0;
-static int g_state = 0;   // 0 wait, 1 record, 2 replay, 3 hold, 4 done
+static int g_state = 0;
 static void* g_human = 0;
 static void* g_bot = 0;
 static Vec g_start, g_pos;
@@ -94,6 +100,7 @@ static bool g_moved = false;
 static double g_lastSample = 0, g_stillSince = 0, g_lastT = 0, g_lastLog = 0, g_holdStart = 0;
 static int g_idx = 0;
 static int g_humanTeam = 0;
+static int g_lastHp = -1;
 
 static void AddEnt(void* e) {
     for (int i = 0; i < g_count; i++) if (g_ents[i] == e) return;
@@ -116,8 +123,18 @@ static void Census() {
     for (int i = 0; i < g_count; i++) {
         IPlayerInfo* p = Info(g_ents[i]);
         if (!p) { Log("  slot %d: no info", i); continue; }
-        Log("  %s | team %d | %s | %s", p->GetName(), p->GetTeamIndex(),
-            p->IsFakeClient() ? "BOT" : "HUMAN", p->IsDead() ? "dead" : "alive");
+        Log("  %s | team %d | %s | %s | hp %d", p->GetName(), p->GetTeamIndex(),
+            p->IsFakeClient() ? "BOT" : "HUMAN", p->IsDead() ? "dead" : "alive", p->GetHealth());
+    }
+}
+
+static void TrackHp(IPlayerInfo* b) {
+    int hp = b->GetHealth();
+    if (hp != g_lastHp) {
+        Vec a = b->GetAbsOrigin();
+        Log("HP: %d -> %d | route point %d/%d | actual (%.0f %.0f %.0f) | ours (%.0f %.0f %.0f)",
+            g_lastHp, hp, g_idx, g_np, a.x, a.y, a.z, g_pos.x, g_pos.y, g_pos.z);
+        g_lastHp = hp;
     }
 }
 
@@ -178,12 +195,18 @@ static void PathTest(double t) {
             for (int i = 0; i < g_count; i++) {
                 IPlayerInfo* p = Info(g_ents[i]);
                 if (p && p->IsFakeClient() && !p->IsDead() && p->GetTeamIndex() == g_humanTeam) {
+                    IBotController* bc0 = g_bm->GetBotController(g_ents[i]);
+                    if (!bc0) { Log("PATH: GetBotController returned null"); g_state = 4; return; }
                     g_bot = g_ents[i];
-                    g_pos = p->GetAbsOrigin();
-                    g_idx = 0;
+                    Vec was = p->GetAbsOrigin();
+                    g_pos = g_path[0];
+                    bc0->SetAbsOrigin(g_pos);
+                    g_idx = 1;
                     g_lastT = t;
                     g_lastLog = t;
-                    Log("PATH: bot %s starting replay from (%.0f %.0f %.0f)", p->GetName(), g_pos.x, g_pos.y, g_pos.z);
+                    g_lastHp = -1;
+                    Log("PATH: bot %s jumped from (%.0f %.0f %.0f) to route start (%.0f %.0f %.0f), hp %d",
+                        p->GetName(), was.x, was.y, was.z, g_pos.x, g_pos.y, g_pos.z, p->GetHealth());
                     break;
                 }
             }
@@ -193,7 +216,12 @@ static void PathTest(double t) {
             }
         }
         IPlayerInfo* b = Info(g_bot);
-        if (!b || b->IsDead()) { Log("PATH: bot died or left, aborted at point %d of %d", g_idx, g_np); g_state = 4; return; }
+        if (!b || b->IsDead()) {
+            Log("PATH: bot died or left at route point %d of %d, last hp %d, last pos (%.0f %.0f %.0f)",
+                g_idx, g_np, g_lastHp, g_pos.x, g_pos.y, g_pos.z);
+            g_state = 4; return;
+        }
+        TrackHp(b);
         IBotController* bc = g_bm->GetBotController(g_bot);
         if (!bc) { Log("PATH: GetBotController returned null"); g_state = 4; return; }
         double dt = t - g_lastT;
@@ -223,7 +251,8 @@ static void PathTest(double t) {
 
     if (g_state == 3) {
         IPlayerInfo* b = Info(g_bot);
-        if (!b || b->IsDead()) { Log("PATH: bot died while holding"); g_state = 4; return; }
+        if (!b || b->IsDead()) { Log("PATH: bot died while holding, last hp %d", g_lastHp); g_state = 4; return; }
+        TrackHp(b);
         IBotController* bc = g_bm->GetBotController(g_bot);
         if (bc) bc->SetAbsOrigin(g_pos);
         if (t - g_holdStart >= 15.0) { Log("PATH: released"); g_state = 4; }
@@ -233,7 +262,7 @@ static void PathTest(double t) {
 class SpreadPlugin {
 public:
     virtual bool Load(CreateInterfaceFn, CreateInterfaceFn gameFactory) {
-        Log("=== Spread v0.4 loaded ===");
+        Log("=== Spread v0.5 loaded ===");
         if (gameFactory) {
             g_pim = (IPlayerInfoManager*)gameFactory("PlayerInfoManager002", 0);
             g_bm = (IBotManager*)gameFactory("BotManager001", 0);
@@ -245,10 +274,10 @@ public:
     virtual void Unload() { Log("Unload called"); g_pim = 0; g_bm = 0; g_count = 0; }
     virtual void Pause() {}
     virtual void UnPause() {}
-    virtual const char* GetPluginDescription() { return "Spread v0.4"; }
+    virtual const char* GetPluginDescription() { return "Spread v0.5"; }
     virtual void LevelInit(const char* map) {
         Log("map: %s", map ? map : "?");
-        g_state = 0; g_np = 0; g_human = 0; g_bot = 0; g_firstFrame = true;
+        g_state = 0; g_np = 0; g_human = 0; g_bot = 0; g_firstFrame = true; g_lastHp = -1;
     }
     virtual void ServerActivate(void*, int, int maxc) { Log("server activate, maxclients %d", maxc); }
     virtual void GameFrame(bool) {
