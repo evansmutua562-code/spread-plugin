@@ -82,13 +82,18 @@ static double g_last = 0;
 static bool g_firstFrame = true;
 static double g_t0 = 0;
 
-// steering test state
-static int g_steerState = 0;   // 0 wait, 1 holding, 2 released/watching, 3 done
-static void* g_target = 0;
-static Vec g_p0;
-static double g_t1 = 0;
-static float g_maxDrift = 0;
-static int g_frames = 0;
+// path record + replay test
+static const int MAXP = 1200;
+static Vec g_path[MAXP];
+static int g_np = 0;
+static int g_state = 0;   // 0 wait, 1 record, 2 replay, 3 hold, 4 done
+static void* g_human = 0;
+static void* g_bot = 0;
+static Vec g_start, g_pos;
+static bool g_moved = false;
+static double g_lastSample = 0, g_stillSince = 0, g_lastT = 0, g_lastLog = 0, g_holdStart = 0;
+static int g_idx = 0;
+static int g_humanTeam = 0;
 
 static void AddEnt(void* e) {
     for (int i = 0; i < g_count; i++) if (g_ents[i] == e) return;
@@ -101,73 +106,134 @@ static void RemoveEnt(void* e) {
     }
 }
 
+static IPlayerInfo* Info(void* e) {
+    return (e && g_pim) ? g_pim->GetPlayerInfo(e) : 0;
+}
+
 static void Census() {
     Log("--- census (%d clients) ---", g_count);
     if (!g_pim) { Log("PlayerInfoManager not available"); return; }
     for (int i = 0; i < g_count; i++) {
-        IPlayerInfo* p = g_pim->GetPlayerInfo(g_ents[i]);
+        IPlayerInfo* p = Info(g_ents[i]);
         if (!p) { Log("  slot %d: no info", i); continue; }
         Log("  %s | team %d | %s | %s", p->GetName(), p->GetTeamIndex(),
             p->IsFakeClient() ? "BOT" : "HUMAN", p->IsDead() ? "dead" : "alive");
     }
 }
 
-static void SteerTest(double t) {
-    if (!g_pim || !g_bm || g_steerState == 3) return;
+static void PathTest(double t) {
+    if (!g_pim || !g_bm || g_state >= 4) return;
 
-    if (g_steerState == 0) {
-        if (t - g_t0 < 25.0) return;
+    if (g_state == 0) {
+        if (t - g_t0 < 5.0) return;
         for (int i = 0; i < g_count; i++) {
-            IPlayerInfo* p = g_pim->GetPlayerInfo(g_ents[i]);
-            if (p && p->IsFakeClient() && p->GetTeamIndex() == 2 && !p->IsDead()) {
-                g_target = g_ents[i];
-                g_p0 = p->GetAbsOrigin();
-                g_t1 = t;
-                g_maxDrift = 0;
-                g_frames = 0;
-                g_steerState = 1;
-                Log("STEER: target %s at (%.1f %.1f %.1f) - holding 8s",
-                    p->GetName(), g_p0.x, g_p0.y, g_p0.z);
+            IPlayerInfo* p = Info(g_ents[i]);
+            if (p && !p->IsFakeClient() && !p->IsDead() && p->GetTeamIndex() >= 2) {
+                g_human = g_ents[i];
+                g_start = p->GetAbsOrigin();
+                g_np = 0;
+                g_moved = false;
+                g_lastSample = t;
+                g_stillSince = t;
+                g_state = 1;
+                Log("PATH: recording started. Walk your route and stop at the hold spot for 3 seconds.");
                 return;
             }
         }
         return;
     }
 
-    IPlayerInfo* p = g_pim->GetPlayerInfo(g_target);
-    if (!p || p->IsDead()) { Log("STEER: target gone/dead, aborting"); g_steerState = 3; return; }
-
-    if (g_steerState == 1) {
-        Vec cur = p->GetAbsOrigin();
-        float d = Dist(cur, g_p0);
-        if (d > g_maxDrift) g_maxDrift = d;
-        IBotController* bc = g_bm->GetBotController(g_target);
-        if (!bc) { Log("STEER: GetBotController returned null"); g_steerState = 3; return; }
-        bc->SetAbsOrigin(g_p0);
-        g_frames++;
-        if (t - g_t1 >= 8.0) {
-            Vec after = p->GetAbsOrigin();
-            Log("STEER: hold over. frames %d, max drift before reset %.1f, final dist from hold point %.1f",
-                g_frames, g_maxDrift, Dist(after, g_p0));
-            g_t1 = t;
-            g_steerState = 2;
+    if (g_state == 1) {
+        if (t - g_lastSample < 0.25) return;
+        g_lastSample = t;
+        IPlayerInfo* h = Info(g_human);
+        if (!h || h->IsDead()) { Log("PATH: you died or left, recording aborted"); g_state = 4; return; }
+        Vec pos = h->GetAbsOrigin();
+        if (!g_moved) {
+            if (Dist(pos, g_start) < 60) return;
+            g_moved = true;
+            g_path[g_np++] = g_start;
+            g_stillSince = t;
+        }
+        Vec last = g_path[g_np - 1];
+        if (Dist(pos, last) >= 20) {
+            if (g_np < MAXP) g_path[g_np++] = pos;
+            g_stillSince = t;
+        } else if (t - g_stillSince >= 3.0 && Dist(pos, g_path[0]) >= 500 && g_np >= 20) {
+            g_humanTeam = h->GetTeamIndex();
+            Log("PATH: recorded %d points, ending at (%.0f %.0f %.0f)", g_np, pos.x, pos.y, pos.z);
+            g_state = 2; g_bot = 0; g_lastT = t; g_lastLog = t;
+            return;
+        }
+        if (g_np >= MAXP) {
+            g_humanTeam = h->GetTeamIndex();
+            Log("PATH: path buffer full, using %d points", g_np);
+            g_state = 2; g_bot = 0; g_lastT = t; g_lastLog = t;
         }
         return;
     }
 
-    if (g_steerState == 2) {
-        if (t - g_t1 >= 4.0) {
-            Vec now = p->GetAbsOrigin();
-            Log("STEER: 4s after release, bot is %.1f units from hold point", Dist(now, g_p0));
-            g_steerState = 3;
+    if (g_state == 2) {
+        if (!g_bot) {
+            for (int i = 0; i < g_count; i++) {
+                IPlayerInfo* p = Info(g_ents[i]);
+                if (p && p->IsFakeClient() && !p->IsDead() && p->GetTeamIndex() == g_humanTeam) {
+                    g_bot = g_ents[i];
+                    g_pos = p->GetAbsOrigin();
+                    g_idx = 0;
+                    g_lastT = t;
+                    g_lastLog = t;
+                    Log("PATH: bot %s starting replay from (%.0f %.0f %.0f)", p->GetName(), g_pos.x, g_pos.y, g_pos.z);
+                    break;
+                }
+            }
+            if (!g_bot) {
+                if (t - g_lastLog >= 5.0) { Log("PATH: no living bot on your team, waiting"); g_lastLog = t; }
+                return;
+            }
         }
+        IPlayerInfo* b = Info(g_bot);
+        if (!b || b->IsDead()) { Log("PATH: bot died or left, aborted at point %d of %d", g_idx, g_np); g_state = 4; return; }
+        IBotController* bc = g_bm->GetBotController(g_bot);
+        if (!bc) { Log("PATH: GetBotController returned null"); g_state = 4; return; }
+        double dt = t - g_lastT;
+        g_lastT = t;
+        if (dt > 0.2) dt = 0.2;
+        float budget = 250.0f * (float)dt;
+        while (budget > 0 && g_idx < g_np) {
+            Vec tgt = g_path[g_idx];
+            float d = Dist(g_pos, tgt);
+            if (d <= budget) { g_pos = tgt; budget -= d; g_idx++; }
+            else {
+                float f = budget / d;
+                g_pos.x += (tgt.x - g_pos.x) * f;
+                g_pos.y += (tgt.y - g_pos.y) * f;
+                g_pos.z += (tgt.z - g_pos.z) * f;
+                budget = 0;
+            }
+        }
+        bc->SetAbsOrigin(g_pos);
+        if (t - g_lastLog >= 2.0) {
+            Log("PATH: replay point %d/%d, bot at (%.0f %.0f %.0f)", g_idx, g_np, g_pos.x, g_pos.y, g_pos.z);
+            g_lastLog = t;
+        }
+        if (g_idx >= g_np) { Log("PATH: arrived, holding 15s"); g_holdStart = t; g_state = 3; }
+        return;
+    }
+
+    if (g_state == 3) {
+        IPlayerInfo* b = Info(g_bot);
+        if (!b || b->IsDead()) { Log("PATH: bot died while holding"); g_state = 4; return; }
+        IBotController* bc = g_bm->GetBotController(g_bot);
+        if (bc) bc->SetAbsOrigin(g_pos);
+        if (t - g_holdStart >= 15.0) { Log("PATH: released"); g_state = 4; }
     }
 }
 
 class SpreadPlugin {
 public:
     virtual bool Load(CreateInterfaceFn, CreateInterfaceFn gameFactory) {
-        Log("=== Spread v0.3 loaded ===");
+        Log("=== Spread v0.4 loaded ===");
         if (gameFactory) {
             g_pim = (IPlayerInfoManager*)gameFactory("PlayerInfoManager002", 0);
             g_bm = (IBotManager*)gameFactory("BotManager001", 0);
@@ -179,16 +245,16 @@ public:
     virtual void Unload() { Log("Unload called"); g_pim = 0; g_bm = 0; g_count = 0; }
     virtual void Pause() {}
     virtual void UnPause() {}
-    virtual const char* GetPluginDescription() { return "Spread v0.3"; }
+    virtual const char* GetPluginDescription() { return "Spread v0.4"; }
     virtual void LevelInit(const char* map) {
         Log("map: %s", map ? map : "?");
-        g_steerState = 0; g_target = 0; g_firstFrame = true;
+        g_state = 0; g_np = 0; g_human = 0; g_bot = 0; g_firstFrame = true;
     }
     virtual void ServerActivate(void*, int, int maxc) { Log("server activate, maxclients %d", maxc); }
     virtual void GameFrame(bool) {
         double t = Now();
         if (g_firstFrame) { g_firstFrame = false; g_t0 = t; Log("GameFrame is running"); }
-        SteerTest(t);
+        PathTest(t);
         if (t - g_last < 15.0) return;
         g_last = t;
         Census();
